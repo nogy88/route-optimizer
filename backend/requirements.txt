@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+ortools
+pandas
+openpyxl
+numpy
+requests
+python-multipart
+sqlalchemy
