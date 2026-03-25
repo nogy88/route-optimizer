@@ -392,77 +392,38 @@ def _or_tools_solve(
 
     # Scale to decimetres for OR-Tools integer arithmetic
     # (avoids int32 overflow on routes spanning hundreds of km)
-    dist_dm  = (dist_mat / 10.0).astype(np.int64)
-    # dur_svc: travel + service time — used ONLY for the Time dimension
-    # so OR-Tools schedules accurate arrival/departure times at each stop.
-    dur_svc  = (dur_mat + config.SERVICE_TIME_SECONDS).astype(np.int64)
-    # dur_pure: raw travel time with NO service time — used as arc COST
-    # for "fastest" mode.  Keeping service time out of arc cost prevents
-    # the solver from gaming the objective by dropping stops (every dropped
-    # stop saves SERVICE_TIME_SECONDS from the arc-cost sum).
-    dur_pure = dur_mat.astype(np.int64)
+    dist_dm = (dist_mat / 10.0).astype(np.int64)
+    dur_svc = (dur_mat + config.SERVICE_TIME_SECONDS).astype(np.int64)
 
     # ── 4. Routing model ────────────────────────────────────────
     manager = pywrapcp.RoutingIndexManager(n, nv, [0] * nv, [0] * nv)
     routing = pywrapcp.RoutingModel(manager)
 
-    DEPOT_NODE = 0   # index 0 is always the depot
-
     # ── 5. Arc-cost callbacks ───────────────────────────────────
-    #
-    # Three modes — each has a depot-zero variant so the return-to-depot
-    # leg is never penalised in the objective.  Scheduling accuracy is
-    # preserved via the Time dimension which uses dur_svc (with service time).
-    #
-    # FASTEST  — minimise pure travel time between stores (no service-time
-    #            bias, no distance metric).
-    # CHEAPEST — minimise total monetary cost: fuel ₮ per km × distance,
-    #            weighted per-vehicle.  Fixed/labor costs are per-day so they
-    #            don't affect route shape, only the reported ₮ total.
-    # SHORTEST — minimise total driving distance (km).
+    def _dist_cb(fi, ti):
+        return int(dist_dm[manager.IndexToNode(fi)][manager.IndexToNode(ti)])
 
-    # Scheduling callback — includes service time; only fed to Time dimension.
-    def _sched_cb(fi, ti):
+    def _time_cb(fi, ti):
         return int(dur_svc[manager.IndexToNode(fi)][manager.IndexToNode(ti)])
 
-    sched_cb_idx = routing.RegisterTransitCallback(_sched_cb)
+    dist_cb_idx = routing.RegisterTransitCallback(_dist_cb)
+    time_cb_idx = routing.RegisterTransitCallback(_time_cb)
 
     if mode == "fastest":
-        # Pure travel time, depot arcs free
-        def _fast_cb(fi, ti):
-            ni, nj = manager.IndexToNode(fi), manager.IndexToNode(ti)
-            if nj == DEPOT_NODE:
-                return 0
-            return int(dur_pure[ni][nj])
-        routing.SetArcCostEvaluatorOfAllVehicles(
-            routing.RegisterTransitCallback(_fast_cb)
-        )
-
+        routing.SetArcCostEvaluatorOfAllVehicles(time_cb_idx)
     elif mode == "cheapest":
-        # Fuel cost = dist_dm (decimetres) × fuel_cost_km / 10 000
-        # Depot arcs free — only inter-store cost matters
         for vi, veh in enumerate(vehicles):
             fpm = veh["fuel_cost_km"] / 10_000.0   # ₮ per decimetre
             def _make_fuel(f):
                 def cb(fi, ti):
-                    ni, nj = manager.IndexToNode(fi), manager.IndexToNode(ti)
-                    if nj == DEPOT_NODE:
-                        return 0
-                    return int(dist_dm[ni][nj] * f)
+                    return int(dist_dm[manager.IndexToNode(fi)]
+                                      [manager.IndexToNode(ti)] * f)
                 return cb
             routing.SetArcCostEvaluatorOfVehicle(
                 routing.RegisterTransitCallback(_make_fuel(fpm)), vi
             )
-
-    else:  # "shortest" — minimise driving distance, depot arcs free
-        def _dist_cb(fi, ti):
-            ni, nj = manager.IndexToNode(fi), manager.IndexToNode(ti)
-            if nj == DEPOT_NODE:
-                return 0
-            return int(dist_dm[ni][nj])
-        routing.SetArcCostEvaluatorOfAllVehicles(
-            routing.RegisterTransitCallback(_dist_cb)
-        )
+    else:  # "shortest" — minimize distance
+        routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
 
     # Small fixed cost per trip discourages unnecessary empty trips
     routing.SetFixedCostOfAllVehicles(config.VEHICLE_FIXED_COST)
@@ -490,11 +451,9 @@ def _or_tools_solve(
     )
 
     # ── 8. Time-window dimension ────────────────────────────────
-    # Must use sched_cb_idx (travel + service time) so cumulative time at each
-    # node correctly accounts for unloading before the truck can move on.
     routing.AddDimension(
-        sched_cb_idx,
-        7_200,      # max slack (2h waiting) — allows early arrivals / waiting
+        time_cb_idx,
+        7_200,      # max slack (2h waiting) — allows depots / early arrivals
         max_h_s,
         False,
         "Time"
@@ -517,9 +476,8 @@ def _or_tools_solve(
         time_dim.CumulVar(routing.Start(vi)).SetRange(start_off, max_h_s)
         time_dim.CumulVar(routing.End(vi)).SetRange(start_off, max_h_s)
 
-    # GlobalSpan on the Time dimension would pull routes toward depot-proximity
-    # (return leg is in real time).  Capacity constraints balance load instead.
-    time_dim.SetGlobalSpanCostCoefficient(0)
+    # Minimise total route span → tighter loops
+    time_dim.SetGlobalSpanCostCoefficient(10)
 
     # ── 9. Disjunctions (allow dropping with heavy penalty) ─────
     for i in range(1, n):
@@ -714,6 +672,15 @@ def _solve_fleet_multitrip(
     truck_return: Dict[str, float] = {
         v["truck_id"]: 0.0 for v in vehicles
     }
+
+    # Pre-sort stores: highest-demand first, then tightest time-window first.
+    # This helps the solver pack heavy stores into Trip 1 when capacity is tight.
+    # Use fleet-appropriate demand field — store dicts have dry_kg/cold_kg, NOT demand_kg.
+    dem_field = "dry_kg" if fleet == "DRY" else "cold_kg"
+    remaining = sorted(
+        remaining,
+        key=lambda s: (-s.get(dem_field, 0.0), s.get("close_s", 86399))
+    )
 
     for trip_num in range(1, config.MAX_TRIPS_PER_VEHICLE + 1):
         if not remaining:
