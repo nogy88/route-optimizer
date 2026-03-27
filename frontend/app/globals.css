@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+/* ── VRP design tokens ─────────────────────────────── */
+@theme inline {
+  --color-acc:     #5B7CFA;
+  --color-acc2:    #4362E8;
+  --color-cold:    #0EA5E9;
+  --color-emerald: #10B981;
+  --color-rose:    #EF4444;
+  --color-amber:   #F59E0B;
+  --color-purple:  #8B5CF6;
+  --color-muted:   #7B82A0;
+  --color-text:    #1A1D2E;
+  --color-sub:     #F5F7FF;
+  --color-card:    #FFFFFF;
+  --color-line:    #E2E8F8;
+  --color-line2:   #C8D3F0;
+
+  --font-sans: Inter, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+}
+
+/* ── Base resets ───────────────────────────────────── */
+*  { box-sizing: border-box; }
+body {
+  background: #F5F7FF;
+  color: #1A1D2E;
+  font-family: Inter, system-ui, sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  margin: 0;
+}
+::-webkit-scrollbar        { width: 4px; height: 4px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: #C8D3F0; border-radius: 10px; }
+
+/* ── Leaflet ───────────────────────────────────────── */
+.leaflet-popup-content-wrapper {
+  background: #fff !important;
+  border: 1px solid #E2E8F8 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 8px 32px rgba(91,124,250,0.13) !important;
+  color: #1A1D2E !important;
+}
+.leaflet-popup-tip           { background: #fff !important; }
+.leaflet-control-zoom a      { background: #fff !important; border-color: #E2E8F8 !important; }
+.leaflet-control-attribution { display: none !important; }
+
+/* ── Tiny animation helpers ────────────────────────── */
+@keyframes slide-up   { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes fade-in    { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pulse-dot  { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+
+.anim-up   { animation: slide-up 0.22s ease-out; }
+.anim-fade { animation: fade-in  0.18s ease; }
+.anim-pulse{ animation: pulse-dot 1.5s ease-in-out infinite; }
