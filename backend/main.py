@@ -173,10 +173,19 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     ds = db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(404, "Dataset not found")
-    # Unlink jobs referencing this dataset before deleting
-    # (avoids foreign-key constraint; jobs are preserved in history)
+    
+    # Delete related records in proper order to avoid foreign key constraints
+    # 1. Unlink jobs and run groups from dataset (preserve in history)
     db.query(Job).filter(Job.dataset_id == dataset_id).update({"dataset_id": None})
-    db.commit()
+    from database import RunGroup
+    db.query(RunGroup).filter(RunGroup.dataset_id == dataset_id).update({"dataset_id": None})
+    
+    # 2. Delete stores and vehicles (these have foreign key constraints)
+    from database import Store, Vehicle
+    db.query(Store).filter(Store.dataset_id == dataset_id).delete()
+    db.query(Vehicle).filter(Vehicle.dataset_id == dataset_id).delete()
+    
+    # 3. Now delete the dataset
     db.delete(ds)
     db.commit()
     return {"ok": True}
@@ -195,6 +204,73 @@ async def upload_matrix_to_dataset(
     db.commit()
     return {"ok": True, "dataset_id": dataset_id}
 
+
+
+
+# ════════════════════════════════════════════════════════════
+#  Dataset Export  (stores + vehicles + optional matrix)
+# ════════════════════════════════════════════════════════════
+
+@app.get("/api/datasets/{dataset_id}/export")
+def export_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    """Export dataset stores + vehicles (and matrix sheets if available) as Excel."""
+    import pandas as pd
+    import io as _io
+
+    ds = db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(404, "Dataset not found")
+
+    def fmt_time(s: int) -> str:
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:00"
+
+    stores_data = [{
+        config.COL_STORE_ID  : s.store_id,
+        config.COL_ENG_NAME  : s.eng_name or "",
+        config.COL_MN_NAME   : s.mn_name or "",
+        config.COL_ADDR      : s.address or "",
+        config.COL_DTL_ADDR  : s.detail_addr or "",
+        config.COL_LAT       : s.lat,
+        config.COL_LON       : s.lon,
+        config.COL_OPEN      : fmt_time(s.open_s),
+        config.COL_CLOSE     : fmt_time(s.close_s),
+        config.COL_DRY_CBM   : s.dry_cbm,
+        config.COL_DRY_KG    : s.dry_kg,
+        config.COL_COLD_CBM  : s.cold_cbm,
+        config.COL_COLD_KG   : s.cold_kg,
+    } for s in ds.stores]
+
+    vehicles_data = [{
+        config.COL_DEPOT       : v.depot,
+        config.COL_TRUCK_ID    : v.truck_id,
+        config.COL_DESCRIPTION : v.description or "",
+        config.COL_CAP_KG      : v.cap_kg,
+        config.COL_CAP_M3      : v.cap_m3,
+        config.COL_FUEL_COST   : v.fuel_cost_km,
+        config.COL_VEHICLE_COST: v.vehicle_cost,
+        config.COL_LABOR_COST  : v.labor_cost,
+    } for v in ds.vehicles]
+
+    buf = _io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pd.DataFrame(stores_data).to_excel(writer, sheet_name=config.STORE_SHEET, index=False)
+        pd.DataFrame(vehicles_data).to_excel(writer, sheet_name=config.VEHICLE_SHEET, index=False)
+        # Include matrix sheets if dataset has one
+        if ds.matrix_bytes:
+            try:
+                dist_df, dur_df = data_loader.load_matrix(ds.matrix_bytes)
+                dur_df.to_excel(writer, sheet_name=config.DURATION_SHEET)
+                dist_df.to_excel(writer, sheet_name=config.DISTANCE_SHEET)
+            except Exception as me:
+                log.warning(f"Could not include matrix in export: {me}")
+
+    buf.seek(0)
+    safe_name = ds.name.replace(" ", "_").replace("/", "-")
+    return Response(
+        content=buf.read(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_dataset.xlsx"'},
+    )
 
 # ════════════════════════════════════════════════════════════
 #  Store CRUD
