@@ -14,6 +14,7 @@ A production-grade Vehicle Routing Problem (VRP) solver for delivery logistics o
 ### 1. Clone Repository
 ```bash
 git clone https://github.com/goruden/route-optimizer.git
+
 cd route
 ```
 
@@ -367,3 +368,21 @@ docker-compose logs osrm
 2. Create feature branch
 3. Make changes with tests
 4. Submit pull request
+<<<<<<< HEAD
+=======
+
+---
+
+## 📄 License
+
+[Add your license information here]
+
+---
+
+## 📞 Support
+
+For issues and questions:
+- Create GitHub issue
+- Check troubleshooting section
+- Review API documentation at `/docs`
+>>>>>>> 8df7e78 (Add comprehensive README and fix next-env.d.ts)
