@@ -6,4 +6,6 @@ openpyxl
 numpy
 requests
 python-multipart
-sqlalchemy
+# sqlalchemy
+motor
+pymongo

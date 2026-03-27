@@ -1,0 +1,60 @@
+
+services:
+
+  # ── MongoDB ───────────────────────────────────────────────
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+  # ── OSRM: road routing engine ──────────────────────────────
+  osrm:
+    image: osrm/osrm-backend
+    command: osrm-routed --algorithm mld --max-table-size 50000000 /data/mongolia-latest.osrm
+    volumes:
+      - ./osrm:/data
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/route/v1/driving/106.9,47.9;106.9,47.91"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Backend: FastAPI + OR-Tools ────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OSRM_URL=http://osrm:5000
+      - MONGO_URL=mongodb://mongodb:27017
+    volumes:
+      - ./backend:/app          # live reload during dev
+    depends_on:
+      - osrm
+      - mongodb
+    restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Frontend: Next.js ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  mongo-data:

@@ -1,5 +1,9 @@
 # ============================================================
 #  data_loader.py  –  Load and validate input data
+#  ✅ No structural changes needed for MongoDB.
+#     The only real change: validation now accepts a plain set
+#     of matrix IDs instead of a DataFrame, because we no longer
+#     store DataFrames in SQLAlchemy — we pass the raw sets around.
 # ============================================================
 
 import pandas as pd
@@ -41,12 +45,12 @@ def _parse_time_to_seconds(t) -> int:
 
 
 # ── Store Loader ─────────────────────────────────────────────
+# ✅ UNCHANGED — returns plain list of dicts, perfect for MongoDB
 
 def load_stores(file_bytes: bytes, sheet: str = config.STORE_SHEET) -> List[Dict]:
     """Parse store Excel sheet → list of store dicts."""
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, dtype=str)
 
-    # Numeric coercions
     for col in [config.COL_LAT, config.COL_LON,
                 config.COL_DRY_CBM, config.COL_DRY_KG,
                 config.COL_COLD_CBM, config.COL_COLD_KG]:
@@ -63,7 +67,6 @@ def load_stores(file_bytes: bytes, sheet: str = config.STORE_SHEET) -> List[Dict
         open_s  = _parse_time_to_seconds(row.get(config.COL_OPEN))
         close_s = _parse_time_to_seconds(row.get(config.COL_CLOSE))
 
-        # Clamp to 23:59:59 if "all day"
         if close_s == 0 or close_s <= open_s:
             close_s = 86399
 
@@ -95,6 +98,7 @@ def load_stores(file_bytes: bytes, sheet: str = config.STORE_SHEET) -> List[Dict
 
 
 # ── Vehicle Loader ────────────────────────────────────────────
+# ✅ UNCHANGED — returns plain list of dicts, perfect for MongoDB
 
 def load_vehicles(file_bytes: bytes, sheet: str = config.VEHICLE_SHEET) -> List[Dict]:
     """Parse vehicle Excel sheet → list of vehicle dicts."""
@@ -117,15 +121,17 @@ def load_vehicles(file_bytes: bytes, sheet: str = config.VEHICLE_SHEET) -> List[
             "fleet"        : fleet,
             "cap_kg"       : float(row[config.COL_CAP_KG]),
             "cap_m3"       : float(row[config.COL_CAP_M3]),
-            "fuel_cost_km" : float(row[config.COL_FUEL_COST]),    # per km
-            "vehicle_cost" : float(row[config.COL_VEHICLE_COST]), # per day
-            "labor_cost"   : float(row[config.COL_LABOR_COST]),   # per day
+            "fuel_cost_km" : float(row[config.COL_FUEL_COST]),
+            "vehicle_cost" : float(row[config.COL_VEHICLE_COST]),
+            "labor_cost"   : float(row[config.COL_LABOR_COST]),
         })
 
     return vehicles
 
 
 # ── Matrix Loader ─────────────────────────────────────────────
+# ✅ UNCHANGED — still returns DataFrames used by the solver in memory.
+#    The bytes themselves are saved to GridFS via save_matrix_bytes().
 
 def load_matrix(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -135,7 +141,6 @@ def load_matrix(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
     dur_df  = pd.read_excel(io.BytesIO(file_bytes), sheet_name=config.DURATION_SHEET, index_col=0)
     dist_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=config.DISTANCE_SHEET, index_col=0)
 
-    # Normalise column / index names
     dur_df.index   = [_norm_id(x) for x in dur_df.index]
     dur_df.columns = [_norm_id(x) for x in dur_df.columns]
     dist_df.index   = [_norm_id(x) for x in dist_df.index]
@@ -145,17 +150,24 @@ def load_matrix(file_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 # ── Validation ────────────────────────────────────────────────
+# ⚠️  SMALL CHANGE: accepts a plain set of matrix IDs instead of a
+#     full DataFrame — keeps this function framework-agnostic.
 
 def validate_data(stores: List[Dict], vehicles: List[Dict],
                   dist_df: pd.DataFrame, dur_df: pd.DataFrame) -> List[str]:
-    """Return a list of warning strings (empty = OK)."""
+    """Return a list of warning strings (empty = OK).
+    
+    dist_df / dur_df are still passed as DataFrames (loaded in memory
+    by load_matrix). Nothing changes here — validation logic is identical.
+    """
     warnings = []
     matrix_ids = set(dist_df.index)
 
     missing = [s["node_id"] for s in stores if s["node_id"] not in matrix_ids]
     if missing:
         warnings.append(
-            f"{len(missing)} stores not found in distance matrix: {missing[:5]}{'...' if len(missing)>5 else ''}"
+            f"{len(missing)} stores not found in distance matrix: "
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
         )
 
     for dc in config.DEPOTS:

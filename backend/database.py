@@ -1,131 +1,369 @@
 # ============================================================
-#  database.py  v7 — RunGroup + job versioning
+#  database.py  v8 — MongoDB (Motor async driver)
 # ============================================================
 
-import json, datetime
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Boolean,
-    DateTime, Text, LargeBinary, ForeignKey, event, text
-)
-from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
+import datetime
+import json
+from typing import Optional, AsyncGenerator
 
-DB_URL = "sqlite:///./vrp_data.db"
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False}, echo=False)
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorGridFSBucket
+from bson import ObjectId
 
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cur = dbapi_connection.cursor()
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA foreign_keys=ON")
-    cur.close()
+# ── Connection ────────────────────────────────────────────────
 
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+import os
 
-class Base(DeclarativeBase):
-    pass
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+DB_NAME   = "vrp_data"
 
-class RunGroup(Base):
-    __tablename__ = "run_groups"
-    id         = Column(String(36), primary_key=True)
-    name       = Column(String(200), nullable=False)
-    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    jobs = relationship("Job", back_populates="group", order_by="Job.created_at")
-    def to_dict(self):
-        return {"id":self.id,"name":self.name,"dataset_id":self.dataset_id,
-                "created_at":self.created_at.isoformat() if self.created_at else None}
+client: AsyncIOMotorClient = None   # set in startup
+db:     AsyncIOMotorDatabase = None  # set in startup
+fs:     AsyncIOMotorGridFSBucket = None  # for binary blobs (matrix, excel)
 
-class Dataset(Base):
-    __tablename__ = "datasets"
-    id           = Column(Integer, primary_key=True, autoincrement=True)
-    name         = Column(String(200), nullable=False)
-    created_at   = Column(DateTime, default=datetime.datetime.utcnow)
-    matrix_bytes = Column(LargeBinary, nullable=True)
-    stores   = relationship("Store",   back_populates="dataset", cascade="all, delete-orphan")
-    vehicles = relationship("Vehicle", back_populates="dataset", cascade="all, delete-orphan")
-    jobs     = relationship("Job",     back_populates="dataset")
 
-class Store(Base):
-    __tablename__ = "stores"
-    id=Column(Integer,primary_key=True,autoincrement=True); dataset_id=Column(Integer,ForeignKey("datasets.id"),nullable=False)
-    store_id=Column(String(50)); node_id=Column(String(50)); eng_name=Column(String(200)); mn_name=Column(String(200))
-    address=Column(String(400)); detail_addr=Column(String(400)); lat=Column(Float); lon=Column(Float)
-    open_s=Column(Integer,default=0); close_s=Column(Integer,default=86399)
-    dry_cbm=Column(Float,default=0.0); dry_kg=Column(Float,default=0.0)
-    cold_cbm=Column(Float,default=0.0); cold_kg=Column(Float,default=0.0)
-    has_dry=Column(Boolean,default=False); has_cold=Column(Boolean,default=False)
-    dataset=relationship("Dataset",back_populates="stores")
-    def to_dict(self): return {c.name:getattr(self,c.name) for c in self.__table__.columns}
-    def to_solver_dict(self):
-        return {"store_id":self.store_id,"node_id":self.node_id,"eng_name":self.eng_name or "",
-                "mn_name":self.mn_name or "","address":self.address or "","detail_addr":self.detail_addr or "",
-                "lat":self.lat,"lon":self.lon,"open_s":self.open_s,"close_s":self.close_s,
-                "dry_cbm":self.dry_cbm,"dry_kg":self.dry_kg,"cold_cbm":self.cold_cbm,"cold_kg":self.cold_kg,
-                "has_dry":self.has_dry,"has_cold":self.has_cold}
+async def connect_db():
+    """Call once at app startup (e.g. FastAPI lifespan)."""
+    global client, db, fs
+    client = AsyncIOMotorClient(MONGO_URL)
+    db     = client[DB_NAME]
+    fs     = AsyncIOMotorGridFSBucket(db)
+    await init_db()
 
-class Vehicle(Base):
-    __tablename__ = "vehicles"
-    id=Column(Integer,primary_key=True,autoincrement=True); dataset_id=Column(Integer,ForeignKey("datasets.id"),nullable=False)
-    truck_id=Column(String(50)); description=Column(String(200)); depot=Column(String(100)); fleet=Column(String(10))
-    cap_kg=Column(Float); cap_m3=Column(Float); fuel_cost_km=Column(Float); vehicle_cost=Column(Float); labor_cost=Column(Float)
-    dataset=relationship("Dataset",back_populates="vehicles")
-    def to_dict(self): return {c.name:getattr(self,c.name) for c in self.__table__.columns}
-    def to_solver_dict(self):
-        return {"truck_id":self.truck_id,"description":self.description or "","depot":self.depot,"fleet":self.fleet,
-                "cap_kg":self.cap_kg,"cap_m3":self.cap_m3,"fuel_cost_km":self.fuel_cost_km,
-                "vehicle_cost":self.vehicle_cost,"labor_cost":self.labor_cost}
 
-class Job(Base):
-    __tablename__ = "jobs"
-    id                = Column(String(36), primary_key=True)
-    dataset_id        = Column(Integer, ForeignKey("datasets.id"), nullable=True)
-    group_id          = Column(String(36), ForeignKey("run_groups.id"), nullable=True)
-    version_name      = Column(String(100), nullable=True)
-    is_manual         = Column(Boolean, default=False)
-    mode              = Column(String(20))
-    max_trips         = Column(Integer)
-    solver_time       = Column(Integer)
-    rural_solver_time = Column(Integer, nullable=True)
-    status            = Column(String(20), default="pending")
-    error_msg         = Column(Text, nullable=True)
-    created_at        = Column(DateTime, default=datetime.datetime.utcnow)
-    completed_at      = Column(DateTime, nullable=True)
-    dataset = relationship("Dataset", back_populates="jobs")
-    group   = relationship("RunGroup", back_populates="jobs")
-    result  = relationship("JobResult", back_populates="job", uselist=False, cascade="all, delete-orphan")
-    def to_dict(self):
-        return {"id":self.id,"dataset_id":self.dataset_id,"group_id":self.group_id,
-                "version_name":self.version_name,"is_manual":bool(self.is_manual),
-                "mode":self.mode,"max_trips":self.max_trips,"solver_time":self.solver_time,
-                "rural_solver_time":self.rural_solver_time,"status":self.status,"error_msg":self.error_msg,
-                "created_at":self.created_at.isoformat() if self.created_at else None,
-                "completed_at":self.completed_at.isoformat() if self.completed_at else None}
+async def close_db():
+    """Call once at app shutdown."""
+    if client:
+        client.close()
 
-class JobResult(Base):
-    __tablename__ = "job_results"
-    job_id        = Column(String(36), ForeignKey("jobs.id"), primary_key=True)
-    summary_json  = Column(Text); routes_json=Column(Text); stops_json=Column(Text)
-    unserved_json = Column(Text); map_data_json=Column(Text); excel_bytes=Column(LargeBinary)
-    job=relationship("Job",back_populates="result")
-    def get_summary(self):  return json.loads(self.summary_json  or "null")
-    def get_routes(self):   return json.loads(self.routes_json   or "[]")
-    def get_stops(self):    return json.loads(self.stops_json    or "[]")
-    def get_unserved(self): return json.loads(self.unserved_json or "[]")
-    def get_map_data(self): return json.loads(self.map_data_json or "[]")
 
-def init_db():
-    Base.metadata.create_all(engine)
-    # Migrate existing DBs — ignore "duplicate column" errors
-    with engine.connect() as conn:
-        for sql in [
-            "ALTER TABLE jobs ADD COLUMN group_id TEXT REFERENCES run_groups(id)",
-            "ALTER TABLE jobs ADD COLUMN version_name TEXT",
-            "ALTER TABLE jobs ADD COLUMN is_manual INTEGER DEFAULT 0",
-        ]:
-            try: conn.execute(text(sql)); conn.commit()
-            except Exception: pass
+def get_db() -> AsyncIOMotorDatabase:
+    """FastAPI dependency — returns the db handle directly.
+    Motor manages its own connection pool, no teardown needed."""
+    return db
 
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
+
+# ── Indexes (replaces CREATE TABLE / ALTER TABLE) ─────────────
+
+async def init_db():
+    """Create indexes on first run. Safe to call multiple times."""
+    await db["jobs"].create_index("dataset_id")
+    await db["jobs"].create_index("group_id")
+    await db["jobs"].create_index("status")
+    await db["jobs"].create_index("created_at")
+
+    await db["run_groups"].create_index("dataset_id")
+    await db["run_groups"].create_index("created_at")
+
+    await db["datasets"].create_index("name")
+    await db["datasets"].create_index("created_at")
+
+    # stores / vehicles are sub-documents embedded inside datasets,
+    # but if you query them frequently you can also store them in their
+    # own collections — see design note below.
+    await db["stores"].create_index("dataset_id")
+    await db["stores"].create_index("store_id")
+    await db["stores"].create_index([("dataset_id", 1), ("node_id", 1)])
+
+    await db["vehicles"].create_index("dataset_id")
+    await db["vehicles"].create_index("truck_id")
+
+
+# ── Collection helpers ────────────────────────────────────────
+# MongoDB documents use "_id" as the primary key.
+# We keep the same UUID strings you used before so the rest of
+# the codebase doesn't change (pass them in as "_id").
+
+# ════════════════════════════════════════════════════════════
+#  RunGroup
+# ════════════════════════════════════════════════════════════
+
+class RunGroupDoc:
+    """Thin wrapper that mirrors the old ORM .to_dict() interface."""
+    COLLECTION = "run_groups"
+
+    @staticmethod
+    def make(group_id: str, name: str, dataset_id: Optional[int] = None) -> dict:
+        return {
+            "_id"        : group_id,
+            "name"       : name,
+            "dataset_id" : dataset_id,
+            "created_at" : datetime.datetime.utcnow(),
+        }
+
+    @staticmethod
+    def to_dict(doc: dict) -> dict:
+        return {
+            "id"         : doc["_id"],
+            "name"       : doc.get("name"),
+            "dataset_id" : doc.get("dataset_id"),
+            "created_at" : doc["created_at"].isoformat() if doc.get("created_at") else None,
+        }
+
+
+# ════════════════════════════════════════════════════════════
+#  Dataset
+# ════════════════════════════════════════════════════════════
+
+class DatasetDoc:
+    """
+    Datasets live in the 'datasets' collection.
+
+    Binary blobs (matrix_bytes) are stored in GridFS and referenced
+    by a GridFS file _id stored in matrix_file_id.
+    """
+    COLLECTION = "datasets"
+
+    @staticmethod
+    def make(name: str) -> dict:
+        return {
+            "name"           : name,
+            "created_at"     : datetime.datetime.utcnow(),
+            "matrix_file_id" : None,   # set after GridFS upload
+        }
+
+    @staticmethod
+    def to_dict(doc: dict) -> dict:
+        return {
+            "id"             : doc["_id"],
+            "name"           : doc.get("name"),
+            "created_at"     : doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "matrix_file_id" : str(doc["matrix_file_id"]) if doc.get("matrix_file_id") else None,
+        }
+
+
+# ── GridFS helpers for binary blobs ──────────────────────────
+
+async def save_matrix_bytes(dataset_id, matrix_bytes: bytes) -> str:
+    """Upload matrix bytes to GridFS; store returned file_id on dataset doc."""
+    filename = f"matrix_{dataset_id}.bin"
+    file_id  = await fs.upload_from_stream(filename, matrix_bytes)
+    await db[DatasetDoc.COLLECTION].update_one(
+        {"_id": dataset_id},
+        {"$set": {"matrix_file_id": file_id}}
+    )
+    return str(file_id)
+
+
+async def load_matrix_bytes(dataset_id) -> Optional[bytes]:
+    """Download matrix bytes from GridFS for a given dataset."""
+    doc = await db[DatasetDoc.COLLECTION].find_one({"_id": dataset_id}, {"matrix_file_id": 1})
+    if not doc or not doc.get("matrix_file_id"):
+        return None
+    stream = await fs.open_download_stream(doc["matrix_file_id"])
+    return await stream.read()
+
+
+async def save_excel_bytes(job_id: str, excel_bytes: bytes) -> str:
+    """Upload excel output to GridFS; store file_id on job_results doc."""
+    filename = f"excel_{job_id}.xlsx"
+    file_id  = await fs.upload_from_stream(filename, excel_bytes)
+    await db["job_results"].update_one(
+        {"_id": job_id},
+        {"$set": {"excel_file_id": file_id}},
+        upsert=True
+    )
+    return str(file_id)
+
+
+async def load_excel_bytes(job_id: str) -> Optional[bytes]:
+    """Download excel bytes from GridFS for a given job."""
+    doc = await db["job_results"].find_one({"_id": job_id}, {"excel_file_id": 1})
+    if not doc or not doc.get("excel_file_id"):
+        return None
+    stream = await fs.open_download_stream(doc["excel_file_id"])
+    return await stream.read()
+
+
+# ════════════════════════════════════════════════════════════
+#  Store
+# ════════════════════════════════════════════════════════════
+
+class StoreDoc:
+    """Stored in 'stores' collection — one document per store."""
+    COLLECTION = "stores"
+
+    @staticmethod
+    def make(dataset_id, row: dict) -> dict:
+        """row is the dict produced by data_loader.load_stores()"""
+        return {
+            "dataset_id"  : dataset_id,
+            "store_id"    : row["store_id"],
+            "node_id"     : row["node_id"],
+            "eng_name"    : row.get("eng_name", ""),
+            "mn_name"     : row.get("mn_name", ""),
+            "address"     : row.get("address", ""),
+            "detail_addr" : row.get("detail_addr", ""),
+            "lat"         : row["lat"],
+            "lon"         : row["lon"],
+            "open_s"      : row.get("open_s", 0),
+            "close_s"     : row.get("close_s", 86399),
+            "dry_cbm"     : row.get("dry_cbm", 0.0),
+            "dry_kg"      : row.get("dry_kg", 0.0),
+            "cold_cbm"    : row.get("cold_cbm", 0.0),
+            "cold_kg"     : row.get("cold_kg", 0.0),
+            "has_dry"     : row.get("has_dry", False),
+            "has_cold"    : row.get("has_cold", False),
+        }
+
+    @staticmethod
+    def to_solver_dict(doc: dict) -> dict:
+        return {
+            "store_id"    : doc["store_id"],
+            "node_id"     : doc["node_id"],
+            "eng_name"    : doc.get("eng_name", ""),
+            "mn_name"     : doc.get("mn_name", ""),
+            "address"     : doc.get("address", ""),
+            "detail_addr" : doc.get("detail_addr", ""),
+            "lat"         : doc["lat"],
+            "lon"         : doc["lon"],
+            "open_s"      : doc["open_s"],
+            "close_s"     : doc["close_s"],
+            "dry_cbm"     : doc["dry_cbm"],
+            "dry_kg"      : doc["dry_kg"],
+            "cold_cbm"    : doc["cold_cbm"],
+            "cold_kg"     : doc["cold_kg"],
+            "has_dry"     : doc["has_dry"],
+            "has_cold"    : doc["has_cold"],
+        }
+
+
+# ════════════════════════════════════════════════════════════
+#  Vehicle
+# ════════════════════════════════════════════════════════════
+
+class VehicleDoc:
+    COLLECTION = "vehicles"
+
+    @staticmethod
+    def make(dataset_id, row: dict) -> dict:
+        """row is the dict produced by data_loader.load_vehicles()"""
+        return {
+            "dataset_id"   : dataset_id,
+            "truck_id"     : row["truck_id"],
+            "description"  : row.get("description", ""),
+            "depot"        : row["depot"],
+            "fleet"        : row.get("fleet", "DRY"),
+            "cap_kg"       : row["cap_kg"],
+            "cap_m3"       : row["cap_m3"],
+            "fuel_cost_km" : row["fuel_cost_km"],
+            "vehicle_cost" : row["vehicle_cost"],
+            "labor_cost"   : row["labor_cost"],
+        }
+
+    @staticmethod
+    def to_solver_dict(doc: dict) -> dict:
+        return {
+            "truck_id"     : doc["truck_id"],
+            "description"  : doc.get("description", ""),
+            "depot"        : doc["depot"],
+            "fleet"        : doc["fleet"],
+            "cap_kg"       : doc["cap_kg"],
+            "cap_m3"       : doc["cap_m3"],
+            "fuel_cost_km" : doc["fuel_cost_km"],
+            "vehicle_cost" : doc["vehicle_cost"],
+            "labor_cost"   : doc["labor_cost"],
+        }
+
+
+# ════════════════════════════════════════════════════════════
+#  Job
+# ════════════════════════════════════════════════════════════
+
+class JobDoc:
+    COLLECTION = "jobs"
+
+    @staticmethod
+    def make(job_id: str, dataset_id=None, group_id: str = None,
+             version_name: str = None, is_manual: bool = False,
+             mode: str = None, max_trips: int = None,
+             solver_time: int = None, rural_solver_time: int = None) -> dict:
+        return {
+            "_id"              : job_id,
+            "dataset_id"       : dataset_id,
+            "group_id"         : group_id,
+            "version_name"     : version_name,
+            "is_manual"        : is_manual,
+            "mode"             : mode,
+            "max_trips"        : max_trips,
+            "solver_time"      : solver_time,
+            "rural_solver_time": rural_solver_time,
+            "status"           : "pending",
+            "error_msg"        : None,
+            "created_at"       : datetime.datetime.utcnow(),
+            "completed_at"     : None,
+        }
+
+    @staticmethod
+    def to_dict(doc: dict) -> dict:
+        return {
+            "id"               : doc["_id"],
+            "dataset_id"       : doc.get("dataset_id"),
+            "group_id"         : doc.get("group_id"),
+            "version_name"     : doc.get("version_name"),
+            "is_manual"        : bool(doc.get("is_manual", False)),
+            "mode"             : doc.get("mode"),
+            "max_trips"        : doc.get("max_trips"),
+            "solver_time"      : doc.get("solver_time"),
+            "rural_solver_time": doc.get("rural_solver_time"),
+            "status"           : doc.get("status"),
+            "error_msg"        : doc.get("error_msg"),
+            "created_at"       : doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "completed_at"     : doc["completed_at"].isoformat() if doc.get("completed_at") else None,
+        }
+
+
+# ════════════════════════════════════════════════════════════
+#  JobResult
+# ════════════════════════════════════════════════════════════
+
+class JobResultDoc:
+    """
+    Stored in 'job_results' collection.
+    excel_bytes → GridFS (use save_excel_bytes / load_excel_bytes above).
+    All other fields stored directly as JSON strings (same as before).
+    """
+    COLLECTION = "job_results"
+
+    @staticmethod
+    def make(job_id: str, summary: dict, routes: list,
+             stops: list, unserved: list, map_data: list) -> dict:
+        return {
+            "_id"          : job_id,
+            "summary_json" : json.dumps(summary),
+            "routes_json"  : json.dumps(routes),
+            "stops_json"   : json.dumps(stops),
+            "unserved_json": json.dumps(unserved),
+            "map_data_json": json.dumps(map_data),
+            "excel_file_id": None,   # set via save_excel_bytes()
+        }
+
+    @staticmethod
+    def get_summary(doc: dict):  return json.loads(doc.get("summary_json")  or "null")
+    @staticmethod
+    def get_routes(doc: dict):   return json.loads(doc.get("routes_json")   or "[]")
+    @staticmethod
+    def get_stops(doc: dict):    return json.loads(doc.get("stops_json")    or "[]")
+    @staticmethod
+    def get_unserved(doc: dict): return json.loads(doc.get("unserved_json") or "[]")
+    @staticmethod
+    def get_map_data(doc: dict): return json.loads(doc.get("map_data_json") or "[]")
+
+
+# ════════════════════════════════════════════════════════════
+#  Bulk insert helpers  (replaces session.add / session.commit)
+# ════════════════════════════════════════════════════════════
+
+async def bulk_insert_stores(dataset_id, store_rows: list):
+    """Insert all stores for a dataset in one shot."""
+    if not store_rows:
+        return
+    docs = [StoreDoc.make(dataset_id, r) for r in store_rows]
+    await db[StoreDoc.COLLECTION].insert_many(docs, ordered=False)
+
+
+async def bulk_insert_vehicles(dataset_id, vehicle_rows: list):
+    """Insert all vehicles for a dataset in one shot."""
+    if not vehicle_rows:
+        return
+    docs = [VehicleDoc.make(dataset_id, r) for r in vehicle_rows]
+    await db[VehicleDoc.COLLECTION].insert_many(docs, ordered=False)
