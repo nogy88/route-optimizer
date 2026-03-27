@@ -45,3 +45,18 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+.next/
+dist/
+
+# env
+.env
